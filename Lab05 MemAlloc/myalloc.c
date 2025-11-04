@@ -23,20 +23,20 @@ int myinit(size_t size)
     }
 
     int pagesize = getpagesize();
-    printf("...pagesize is %d bytes", pagesize);
+    printf("...pagesize is %d bytes\n", pagesize);
     if(pagesize != size){
-        printf("...adjusting size with page boundaries");
+        printf("...adjusting size with page boundaries\n");
         size = ((size + pagesize - 1) / pagesize) * pagesize;
     }
 
-    printf("...mapping arena with mmap()");
+    printf("...mapping arena with mmap()\n");
     _arena_head = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     arena_size = size;
-    printf("...arena starts at 0x%lx", (unsigned long)_arena_head);
-    printf("...arena ends at 0x%lx", (unsigned long)(_arena_head + size));
+    printf("...arena starts at 0x%lx\n", (unsigned long)_arena_head);
+    printf("...arena ends at 0x%lx\n", (unsigned long)(_arena_head + size));
 
-    printf("...initializing header for initial free chunk");
-    printf("...header size is %zu bytes", sizeof(node_t));
+    printf("...initializing header for initial free chunk\n");
+    printf("...header size is %zu bytes\n", sizeof(node_t));
     // Note: size represents the number of bytes available for allocation and does
     // not include the header bytes. 
     _arena_head->size = size - sizeof(node_t);
@@ -48,20 +48,22 @@ int myinit(size_t size)
 }
 
 int mydestroy(){
+    printf("Destroying Arena:\n");
     if (_arena_head == MAP_FAILED){
         _arena_head = NULL;
         arena_size = 0;
-        printf("...error: cannot destroy unintialized arena. Setting error status");
+        printf("...error: cannot destroy unintialized arena. Setting error status\n");
         return ERR_UNINITIALIZED;
     }
-    printf("...unmapping arena with munmap()");
+    printf("...unmapping arena with munmap()\n");
     munmap(_arena_head, arena_size);
     return 0;
 }
 
 void* myalloc(size_t size){
+    printf("Allocating memory:\n");
     if (_arena_head == NULL || _arena_head == MAP_FAILED){
-        printf("Error: Unitialized. Setting status code");
+        printf("Error: Unitialized. Setting status code\n");
         statusno = ERR_UNINITIALIZED;
         return NULL;
     }
@@ -78,7 +80,7 @@ void* myalloc(size_t size){
         statusno = ERR_OUT_OF_MEMORY;
         return NULL;
     } 
-    printf("...found free chunk of %zu bytes with header at 0x%p\n", best->size, (void*)best);
+    printf("...found free chunk of %zu bytes with header at %p\n", best->size, (void*)best);
     printf("...free chunk->fwd currently points to %p\n",(void*)best->fwd);
     printf("...free chunk->bwd currently points to %p\n",(void*)best->bwd);
     //calculate values
@@ -116,12 +118,22 @@ void* myalloc(size_t size){
 }
 
 void myfree(void *ptr){
+    printf("Freeing allocated memory:\n");
     //Null ptr
     if(!ptr){
         statusno = ERR_UNINITIALIZED;
         return;
     }
+    printf("...supplied pointer %p:\n",(void*)ptr);
+    printf("...being careful with my pointer arthimetic and void pointer casting\n");
     node_t *hptr = (node_t*)(((void*)ptr) - sizeof(node_t));
+    printf("...accessing chunk header at %p\n", (void*)hptr);
+    size_t chunk_size = hptr->size;
+    printf("...chunk of size %ld\n",chunk_size);
+    printf("...checking if coalescing is needed\n");
+    //TODO Check if coalescing is needed
+    //make sure to include print statement that matches tests.out in test-part5
+    printf("...coalescing not needed.\n");
     hptr->is_free = 1;
     return;
 }
