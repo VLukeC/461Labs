@@ -3,28 +3,31 @@
 #include <string.h>
 #include <sys/types.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 #define TRUE 1
 #define FALSE 0
 
 // Output file
-FILE* output_file;
+FILE* output_file = NULL;
 
 // TLB replacement strategy (FIFO or LRU)
-char* strategy;
+char* strategy = NULL;
 
-int offset = -1;
-int PFN;
-int VPN;
-int pid = 0;
-uint32_t timestamp = 0;
+int offset_bits = -1;
+int PFN_bits = 0;
+int VPN_bits = 0;
+int current_pid = 0;          // PID currently executing
+uint32_t timestamp = 0;       // Global timestamp, incremented once per trace instruction
+size_t num_pages = 0;         // 2^VPN_bits
+size_t memory_size = 0;       // 2^(OFF+PFN)
 
-typedef struct{
-    int valid;
-    int PFN;
+typedef struct {
+    unsigned int valid;
+    unsigned int PFN;
 } PTE;
 
-typedef struct{
+typedef struct {
     unsigned int valid;
     unsigned int PFN;
     unsigned int VPN;
@@ -32,19 +35,16 @@ typedef struct{
     uint32_t timestamp;
 } TLB_entry;
 
-typedef struct{
+typedef struct {
     int PID;
-    PTE pte[8];
-    int r1;
-    int r2;
+    PTE* pte;         // dynamically sized page table (num_pages entries)
+    uint32_t r1;
+    uint32_t r2;
 } page_table;
-
-
-
 
 TLB_entry TLB[8];
 page_table page_tables[4];
-uint32_t *memory = NULL;
+uint32_t* memory = NULL;
 
 char** tokenize_input(char* input) {
     char** tokens = NULL;
@@ -53,30 +53,44 @@ char** tokenize_input(char* input) {
 
     while (token != NULL) {
         num_tokens++;
-        tokens = realloc(tokens, num_tokens * sizeof(char*));
-        tokens[num_tokens - 1] = malloc(strlen(token) + 1);
+        tokens = (char**)realloc(tokens, num_tokens * sizeof(char*));
+        tokens[num_tokens - 1] = (char*)malloc(strlen(token) + 1);
         strcpy(tokens[num_tokens - 1], token);
         token = strtok(NULL, " ");
     }
 
     num_tokens++;
-    tokens = realloc(tokens, num_tokens * sizeof(char*));
+    tokens = (char**)realloc(tokens, num_tokens * sizeof(char*));
     tokens[num_tokens - 1] = NULL;
 
     return tokens;
 }
 
-int oldest_TLB(){
-    int best = -1;
-    int min_time = -1;
+static void log_msg(int pid, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fprintf(output_file, "Current PID: %d. ", pid);
+    vfprintf(output_file, fmt, args);
+    fprintf(output_file, "\n");
+    va_end(args);
+}
 
+int oldest_TLB() {
+    int best = -1;
+
+    // First, return the index of the first invalid entry (free slot), if any
     for (int i = 0; i < 8; i++) {
-        if(!TLB[i].valid){
+        if (!TLB[i].valid) {
             return i;
         }
-        if (TLB[i].valid && TLB[i].timestamp < min_time) {
-            min_time = TLB[i].timestamp;
+    }
+
+    // All valid: choose the one with the smallest timestamp
+    uint32_t min_time = 0;
+    for (int i = 0; i < 8; i++) {
+        if (best == -1 || TLB[i].timestamp < min_time) {
             best = i;
+            min_time = TLB[i].timestamp;
         }
     }
     return best;
@@ -84,16 +98,76 @@ int oldest_TLB(){
 
 int lookup_TLB(int vpn, int pid) {
     for (int i = 0; i < 8; i++) {
-        if (TLB[i].valid && TLB[i].VPN == vpn && TLB[i].PID == pid) {
+        if (TLB[i].valid && TLB[i].VPN == (unsigned int)vpn && TLB[i].PID == (unsigned int)pid) {
+            // LRU: update timestamp on hit
+            if (strategy != NULL && strcmp(strategy, "LRU") == 0) {
+                TLB[i].timestamp = timestamp;
+            }
             return i;
         }
     }
-    //Return -1 on miss
-    return -1;
+    return -1; // miss
 }
 
+void tlb_insert_or_update(int vpn, int pfn, int pid) {
+    // First, see if an entry for this (pid,vpn) already exists
+    for (int i = 0; i < 8; i++) {
+        if (TLB[i].valid && TLB[i].VPN == (unsigned int)vpn && TLB[i].PID == (unsigned int)pid) {
+            TLB[i].PFN = (unsigned int)pfn;
+            TLB[i].timestamp = timestamp;
+            return;
+        }
+    }
 
+    int idx = oldest_TLB();
+    TLB[idx].valid = 1;
+    TLB[idx].VPN = (unsigned int)vpn;
+    TLB[idx].PFN = (unsigned int)pfn;
+    TLB[idx].PID = (unsigned int)pid;
+    TLB[idx].timestamp = timestamp;
+}
 
+void tlb_invalidate_vpn_pid(int vpn, int pid) {
+    for (int i = 0; i < 8; i++) {
+        if (TLB[i].valid && TLB[i].VPN == (unsigned int)vpn && TLB[i].PID == (unsigned int)pid) {
+            TLB[i].valid = 0;
+            return;
+        }
+    }
+}
+
+int translate_address(int virtual_address, int* physical_address_out) {
+    int vpn = virtual_address >> offset_bits;
+
+    int tlb_index = lookup_TLB(vpn, current_pid);
+
+    int pfn;
+    if (tlb_index != -1 && TLB[tlb_index].valid) {
+        pfn = TLB[tlb_index].PFN;
+        log_msg(current_pid, "Translating. Lookup for VPN %d hit in TLB entry %d. PFN is %d", vpn, tlb_index, pfn);
+    } else {
+        log_msg(current_pid, "Translating. Lookup for VPN %d caused a TLB miss", vpn);
+
+        if (vpn < 0 || (size_t)vpn >= num_pages) {
+            log_msg(current_pid, "Translating. Translation for VPN %d not found in page table", vpn);
+            return -1;
+        }
+
+        if (page_tables[current_pid].pte[vpn].valid) {
+            pfn = page_tables[current_pid].pte[vpn].PFN;
+            log_msg(current_pid, "Translating. Successfully mapped VPN %d to PFN %d", vpn, pfn);
+            tlb_insert_or_update(vpn, pfn, current_pid);
+        } else {
+            log_msg(current_pid, "Translating. Translation for VPN %d not found in page table", vpn);
+            return -1;
+        }
+    }
+
+    int offset_mask = (1 << offset_bits) - 1;
+    int physical_address = (pfn << offset_bits) | (virtual_address & offset_mask);
+    *physical_address_out = physical_address;
+    return 0;
+}
 
 int main(int argc, char* argv[]) {
     const char usage[] = "Usage: memsym.out <strategy> <input trace> <output trace>\n";
@@ -112,253 +186,296 @@ int main(int argc, char* argv[]) {
 
     // Open input and output files
     FILE* input_file = fopen(input_trace, "r");
-    output_file = fopen(output_trace, "w");  
+    if (!input_file) {
+        perror("Error opening input file");
+        return 1;
+    }
+    output_file = fopen(output_trace, "w");
+    if (!output_file) {
+        perror("Error opening output file");
+        fclose(input_file);
+        return 1;
+    }
 
-    
+    // Initialize page tables and TLB/memory pointers
+    for (int i = 0; i < 4; i++) {
+        page_tables[i].PID = i;
+        page_tables[i].pte = NULL;
+        page_tables[i].r1 = 0;
+        page_tables[i].r2 = 0;
+    }
+    for (int i = 0; i < 8; i++) {
+        TLB[i].valid = 0;
+        TLB[i].PFN = 0;
+        TLB[i].VPN = 0;
+        TLB[i].PID = 0;
+        TLB[i].timestamp = 0;
+    }
 
-    while ( !feof(input_file) ) {
-        // Read input file line by line
-        char *rez = fgets(buffer, sizeof(buffer), input_file);
-        if ( !rez ) {
-            fprintf(stderr, "Reached end of trace. Exiting...\n");
-            return -1;
-        } else {
-            // Remove endline character
-            buffer[strlen(buffer) - 1] = '\0';
+    while (fgets(buffer, sizeof(buffer), input_file) != NULL) {
+        // Strip trailing newline if present
+        size_t len = strlen(buffer);
+        if (len > 0 && (buffer[len-1] == '\n' || buffer[len-1] == '\r')) {
+            buffer[len-1] = '\0';
+            len--;
+            if (len > 0 && buffer[len-1] == '\r') {
+                buffer[len-1] = '\0';
+            }
         }
-        //Skip Commented Lines
-        if (buffer[0] == '%'){
+
+        // Skip comments
+        if (buffer[0] == '%') {
             continue;
         }
+
+        // Increment timestamp for each (non-comment) trace instruction
+        timestamp += 1;
+
         char** tokens = tokenize_input(buffer);
-        
-        if(offset == -1 && strcmp(tokens[0], "define") != 0){
-            fprintf(output_file, "Current PID: %d. ", pid);
-            fprintf(output_file, "Error: attempt to execute instruction before define\n");
-            return -1;
+        if (tokens[0] == NULL) {
+            // Empty line
+            for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+            free(tokens);
+            continue;
         }
-        if(strcmp(tokens[0], "define") == 0){
-            if(offset != -1){
-                fprintf(output_file, "Current PID: %d. ", pid);
-                fprintf(output_file, "Error: multiple calls to define in the same trace\n");
-                return -1;
+
+        // Check define usage
+        if (offset_bits == -1 && strcmp(tokens[0], "define") != 0) {
+            log_msg(current_pid, "Error: attempt to execute instruction before define");
+            for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+            free(tokens);
+            break;
+        }
+
+        if (strcmp(tokens[0], "define") == 0) {
+            if (offset_bits != -1) {
+                log_msg(current_pid, "Error: multiple calls to define in the same trace");
+                for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+                free(tokens);
+                break;
             }
-            offset = atoi(tokens[1]);
-            PFN = atoi(tokens[2]);
-            VPN = atoi(tokens[3]);
-            //Represents Memory
-            size_t memory_size = 1<<(offset+PFN);
-            memory = malloc (memory_size * sizeof(uint32_t));
+
+            offset_bits = atoi(tokens[1]);
+            PFN_bits = atoi(tokens[2]);
+            VPN_bits = atoi(tokens[3]);
+
+            num_pages = ((size_t)1) << VPN_bits;
+            memory_size = ((size_t)1) << (offset_bits + PFN_bits);
+
+            // Allocate physical memory
+            memory = (uint32_t*)malloc(memory_size * sizeof(uint32_t));
+            if (!memory) {
+                for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+                free(tokens);
+                fclose(input_file);
+                fclose(output_file);
+                return 1;
+            }
             memset(memory, 0, memory_size * sizeof(uint32_t));
-            
-            //Page tables
-            for (int x = 0; x < 4; x++){
-                page_tables[x].PID = x;
+
+            // Allocate per-process page tables
+            for (int p = 0; p < 4; p++) {
+                page_tables[p].PID = p;
+                page_tables[p].pte = (PTE*)calloc(num_pages, sizeof(PTE));
             }
-            fprintf(output_file, "Current PID: %d. ", pid);
-            fprintf(output_file, "Memory instantiation complete. OFF bits: %d. PFN bits: %d. VPN bits: %d\n", offset, PFN, VPN);
+
+            log_msg(current_pid, "Memory instantiation complete. OFF bits: %d. PFN bits: %d. VPN bits: %d",
+                    offset_bits, PFN_bits, VPN_bits);
         }
-        else if(strcmp(tokens[0], "ctxswitch") == 0){
-            int prev_pid = pid;
-            pid = atoi(tokens[1]);
-            if(pid < 0 || pid > 3){
-                fprintf(output_file, "Current PID: %d. ", prev_pid);
-                fprintf(output_file, "Invalid context switch to process %d\n", pid);
-                return -1;
+        else if (strcmp(tokens[0], "ctxswitch") == 0) {
+            int new_pid = atoi(tokens[1]);
+            int prev_pid = current_pid;
+            if (new_pid < 0 || new_pid > 3) {
+                log_msg(prev_pid, "Invalid context switch to process %d", new_pid);
+                for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+                free(tokens);
+                break;
             }
-            fprintf(output_file, "Current PID: %d. ", pid);
-            fprintf(output_file, "Switched execution context to process: %d\n", pid);
+            current_pid = new_pid;
+            log_msg(current_pid, "Switched execution context to process: %d", current_pid);
         }
-        else if(strcmp(tokens[0], "load") == 0){
-            //print PID
-            fprintf(output_file, "Current PID: %d. ", pid);
-            int src = -1;
+        else if (strcmp(tokens[0], "load") == 0) {
+            const char* dst = tokens[1];
+            const char* src_str = tokens[2];
 
-            // Load immediate value
-            if(tokens[2][0] == '#'){
-                //Remove #
-                for(int i = 0; tokens[2][i] != '\0'; i++){
-                    tokens[2][i] = tokens[2][i+1];
-                }
-                src = atoi(tokens[2]);
-
-                //Load immediate into register
-                if(strcmp(tokens[1], "r1") == 0){
-                    page_tables[pid].r1 = src;
-                }
-                else if(strcmp(tokens[1], "r2") == 0){
-                    page_tables[pid].r2 = src;
-                }
-                else{
-                    fprintf(output_file, "Error: invalid register operand %s\n", tokens[1]);
-                    return -1;
-                }
-
-                fprintf(output_file, "Loaded immediate %d into register %s\n", src, tokens[1]);
-            }
-            //Load value from virtual memory location
-            else if(tokens[2][0] != '#'){
-                int virtual_address = atoi(tokens[2]);
-                int vpn = virtual_address >> offset;
-                int tlb_index = lookup_TLB(vpn, pid);
-
-                int pfn = -1;
-
-                if(tlb_index != -1 && TLB[tlb_index].valid){
-                    pfn = TLB[tlb_index].PFN;
-                    fprintf(output_file, "Translating. Lookup for VPN %d hit in TLB entry %d. PFN is %d\n", vpn, tlb_index, pfn);
-                }
-                else{
-                    fprintf(output_file, "Translating. Lookup for VPN %d caused a TLB miss\n", vpn);
-
-                    if(page_tables[pid].pte[vpn].valid){
-                        pfn = page_tables[pid].pte[vpn].PFN;
-                        fprintf(output_file, "Current PID: %d. ", pid);
-                        fprintf(output_file, "Translating. Successfully mapped VPN %d to PFN %d\n", vpn, pfn);
-
-                        int insert_idx = oldest_TLB();
-                        TLB[insert_idx].valid = 1;
-                        TLB[insert_idx].VPN = vpn;
-                        TLB[insert_idx].PFN = pfn;
-                        TLB[insert_idx].PID = pid;
-                        TLB[insert_idx].timestamp = timestamp;
-                    }
-                    else{
-                        fprintf(output_file, "Current PID: %d. ", pid);
-                        fprintf(output_file, "Translating. Translation for VPN %d not found in page table\n", vpn);
-                        return -1;
-                    }
-                }
-
-                int physical_address = (pfn << offset) | (virtual_address & ((1 << offset) - 1));
-                src = memory[physical_address];
-
-                //Load value to register
-                if(strcmp(tokens[1], "r1") == 0){
-                    page_tables[pid].r1 = src;
-                }
-                else if(strcmp(tokens[1], "r2") == 0){
-                    page_tables[pid].r2 = src;
-                }
-                else{
-                    fprintf(output_file, "Current PID: %d. ", pid);
-                    fprintf(output_file, "Error: invalid register operand %s\n", tokens[1]);
-                    return -1;
-                }
-                fprintf(output_file, "Current PID: %d. ", pid);
-                fprintf(output_file, "Loaded value of location %s (%d) into register %s\n", tokens[2], src, tokens[1]);
-            }
-        }
-        else if(strcmp(tokens[0], "store") == 0) {
-            //print PID
-            fprintf(output_file, "Current PID: %d. ", pid);
-
-            //Determine if <src> is register or immediate
-            int value;
-            int immediate_flag = 0;
-            if (strcmp(tokens[2], "r1") == 0)
-                value = page_tables[pid].r1;
-            else if (strcmp(tokens[2], "r2") == 0)
-                value = page_tables[pid].r2;
-            else if (tokens[2][0] == '#'){
-                value = atoi(tokens[2] + 1);
-                immediate_flag = 1;
-            }
-            else {
-                fprintf(output_file, "Error: invalid register operand %s\n", tokens[1]);
-                return -1;
-            }
-
-            int virtual_address = atoi(tokens[1]);
-            int vpn = virtual_address >> offset;
-            int tlb_index = lookup_TLB(vpn, pid);
-
-            if (tlb_index != -1 && TLB[tlb_index].valid) {
-                int pfn = TLB[tlb_index].PFN;
-                fprintf(output_file, "Translating. Lookup for VPN %d hit in TLB entry %d. PFN is %d\n", vpn, tlb_index, pfn);
-            } else {
-                fprintf(output_file, "Translating. Lookup for VPN %d caused a TLB miss\n", vpn);
-
-                //Check Page Tables
-                if (page_tables[pid].pte[vpn].valid) {
-                    int pfn = page_tables[pid].pte[vpn].PFN;
-                    fprintf(output_file, "Translating. Successfully mapped VPN %d to PFN %d\n", vpn, pfn);
-                    int insert_idx = oldest_TLB();
-                    TLB[insert_idx].valid = 1;
-                    TLB[insert_idx].VPN = vpn;
-                    TLB[insert_idx].PFN = pfn;
-                    TLB[insert_idx].PID = pid;
-                    TLB[insert_idx].timestamp = timestamp;
-
-
+            // Immediate
+            if (src_str[0] == '#') {
+                int value = atoi(src_str + 1);
+                if (strcmp(dst, "r1") == 0) {
+                    page_tables[current_pid].r1 = (uint32_t)value;
+                } else if (strcmp(dst, "r2") == 0) {
+                    page_tables[current_pid].r2 = (uint32_t)value;
                 } else {
-                    fprintf(output_file, "Translating. Translation for VPN %d not found in page table\n", vpn);
-                    return -1;
+                    log_msg(current_pid, "Error: invalid register operand %s", dst);
+                    for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+                    free(tokens);
+                    break;
                 }
+                log_msg(current_pid, "Loaded immediate %d into register %s", value, dst);
+            } else {
+                // Load from memory (virtual address)
+                int virtual_address = atoi(src_str);
+                int physical_address;
+                if (translate_address(virtual_address, &physical_address) != 0) {
+                    for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+                    free(tokens);
+                    break;
+                }
+                uint32_t value = memory[physical_address];
+
+                if (strcmp(dst, "r1") == 0) {
+                    page_tables[current_pid].r1 = value;
+                } else if (strcmp(dst, "r2") == 0) {
+                    page_tables[current_pid].r2 = value;
+                } else {
+                    log_msg(current_pid, "Error: invalid register operand %s", dst);
+                    for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+                    free(tokens);
+                    break;
+                }
+
+                log_msg(current_pid, "Loaded value of location %s (%u) into register %s", src_str, value, dst);
+            }
+        }
+        else if (strcmp(tokens[0], "store") == 0) {
+            const char* dst_str = tokens[1];
+            const char* src_str = tokens[2];
+
+            int value;
+            int from_register = 0;
+            const char* regname = NULL;
+
+            if (strcmp(src_str, "r1") == 0) {
+                value = (int)page_tables[current_pid].r1;
+                from_register = 1;
+                regname = "r1";
+            } else if (strcmp(src_str, "r2") == 0) {
+                value = (int)page_tables[current_pid].r2;
+                from_register = 1;
+                regname = "r2";
+            } else if (src_str[0] == '#') {
+                value = atoi(src_str + 1);
+                from_register = 0;
+            } else {
+                log_msg(current_pid, "Error: invalid register operand %s", src_str);
+                for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+                free(tokens);
+                break;
             }
 
-            int pfn = (tlb_index != -1 && TLB[tlb_index].valid) ? TLB[tlb_index].PFN : page_tables[pid].pte[vpn].PFN;
-            int physical_address = (pfn << offset) | (virtual_address & ((1 << offset) - 1));
-            memory[physical_address] = value;
-            //print PID
-            fprintf(output_file, "Current PID: %d. ", pid);
-            if(!immediate_flag){
-                fprintf(output_file, "Stored value of register %s (%d) into location %s\n",tokens[2], value, tokens[1]);
+            int virtual_address = atoi(dst_str);
+            int physical_address;
+            if (translate_address(virtual_address, &physical_address) != 0) {
+                for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+                free(tokens);
+                break;
             }
-            else{
-                fprintf(output_file, "Stored immediate %d into location %s\n", value, tokens[1]);
-            }
-            
-        }
-        else if(strcmp(tokens[0], "add") == 0){
-            //print PID
-            fprintf(output_file, "Current PID: %d. ", pid);
-            int prev_r1 = page_tables[pid].r1;
-            page_tables[pid].r1 = page_tables[pid].r1 + page_tables[pid].r2;
-            fprintf(output_file, "Added contents of registers r1 (%d) and r2 (%d). Result: %d\n",prev_r1, page_tables[pid].r2, page_tables[pid].r1);
-        }
-        else if(strcmp(tokens[0], "map") == 0){
-            //print PID
-            fprintf(output_file, "Current PID: %d. ", pid);
 
-            int index = atoi(tokens[1]);
+            memory[physical_address] = (uint32_t)value;
+
+            if (from_register) {
+                log_msg(current_pid, "Stored value of register %s (%d) into location %s", regname, value, dst_str);
+            } else {
+                log_msg(current_pid, "Stored immediate %d into location %s", value, dst_str);
+            }
+        }
+        else if (strcmp(tokens[0], "add") == 0) {
+            uint32_t before_r1 = page_tables[current_pid].r1;
+            uint32_t before_r2 = page_tables[current_pid].r2;
+            page_tables[current_pid].r1 = before_r1 + before_r2;
+            log_msg(current_pid,
+                    "Added contents of registers r1 (%u) and r2 (%u). Result: %u",
+                    before_r1, before_r2, page_tables[current_pid].r1);
+        }
+        else if (strcmp(tokens[0], "map") == 0) {
+            int vpn = atoi(tokens[1]);
             int pfn = atoi(tokens[2]);
-            page_tables[pid].pte[index].valid = 1;
-            page_tables[pid].pte[index].PFN = pfn;
-            int insert_idx = oldest_TLB();
-            TLB[insert_idx].valid = 1;
-            TLB[insert_idx].VPN = index;
-            TLB[insert_idx].PFN = pfn;
-            TLB[insert_idx].PID = pid;
-            TLB[insert_idx].timestamp = timestamp;
 
-            fprintf(output_file, "Mapped virtual page number %d to physical frame number %d\n", index , page_tables[pid].pte[index].PFN);
-        }
-        else if(strcmp(tokens[0], "unmap") == 0){
-            //print PID
-            fprintf(output_file, "Current PID: %d. ", pid);
-
-            int unmapped_vpn = atoi(tokens[1]);
-            page_tables[pid].pte[unmapped_vpn].valid = 0;
-            //Check TLB
-            int unmapped_tlb = lookup_TLB(unmapped_vpn, pid);
-            if(unmapped_tlb != -1){
-                TLB[unmapped_tlb].valid = 0;
+            if (vpn >= 0 && (size_t)vpn < num_pages) {
+                page_tables[current_pid].pte[vpn].valid = 1;
+                page_tables[current_pid].pte[vpn].PFN = (unsigned int)pfn;
             }
-            fprintf(output_file, "Unmapped virtual page number %d\n", unmapped_vpn);
+            tlb_insert_or_update(vpn, pfn, current_pid);
 
+            log_msg(current_pid, "Mapped virtual page number %d to physical frame number %d", vpn, pfn);
         }
-        // Deallocate tokens 
+        else if (strcmp(tokens[0], "unmap") == 0) {
+            int vpn = atoi(tokens[1]);
+
+            if (vpn >= 0 && (size_t)vpn < num_pages) {
+                page_tables[current_pid].pte[vpn].valid = 0;
+                page_tables[current_pid].pte[vpn].PFN = 0;
+            }
+            tlb_invalidate_vpn_pid(vpn, current_pid);
+
+            log_msg(current_pid, "Unmapped virtual page number %d", vpn);
+        }
+        else if (strcmp(tokens[0], "pinspect") == 0) {
+            int vpn = atoi(tokens[1]);
+            uint32_t pfn = 0;
+            unsigned int valid = 0;
+
+            if (vpn >= 0 && (size_t)vpn < num_pages) {
+                pfn = page_tables[current_pid].pte[vpn].PFN;
+                valid = page_tables[current_pid].pte[vpn].valid;
+            }
+            log_msg(current_pid,
+                    "Inspected page table entry %d. Physical frame number: %u. Valid: %u",
+                    vpn, pfn, valid);
+        }
+        else if (strcmp(tokens[0], "tinspect") == 0) {
+            int idx = atoi(tokens[1]);
+            if (idx < 0 || idx >= 8) {
+                log_msg(current_pid,
+                        "Inspected TLB entry %d. VPN: %d. PFN: %d. Valid: %d. PID: %d. Timestamp: %d",
+                        idx, 0, 0, 0, 0, 0);
+            } else {
+                TLB_entry e = TLB[idx];
+                log_msg(current_pid,
+                        "Inspected TLB entry %d. VPN: %u. PFN: %u. Valid: %u. PID: %u. Timestamp: %u",
+                        idx, e.VPN, e.PFN, e.valid, e.PID, e.timestamp);
+            }
+        }
+        else if (strcmp(tokens[0], "linspect") == 0) {
+            int pl = atoi(tokens[1]);
+            uint32_t value = 0;
+            if (pl >= 0 && (size_t)pl < memory_size && memory != NULL) {
+                value = memory[pl];
+            }
+            log_msg(current_pid, "Inspected physical location %d. Value: %u", pl, value);
+        }
+        else if (strcmp(tokens[0], "rinspect") == 0) {
+            const char* reg = tokens[1];
+            if (strcmp(reg, "r1") == 0) {
+                log_msg(current_pid, "Inspected register r1. Content: %u", page_tables[current_pid].r1);
+            } else if (strcmp(reg, "r2") == 0) {
+                log_msg(current_pid, "Inspected register r2. Content: %u", page_tables[current_pid].r2);
+            } else {
+                log_msg(current_pid, "Error: invalid register operand %s", reg);
+                for (int i = 0; tokens[i] != NULL; i++) free(tokens[i]);
+                free(tokens);
+                break;
+            }
+        }
+        // Any other token[0] (including "...") is ignored but still advances the timestamp
+
+        // Deallocate tokens
         for (int i = 0; tokens[i] != NULL; i++)
             free(tokens[i]);
         free(tokens);
-        //Increment timestamp for our TLB entry replacement strategies
-        timestamp += 1;
     }
 
     // Close input and output files
     fclose(input_file);
     fclose(output_file);
+
+    // Free allocated memory
+    if (memory) free(memory);
+    for (int p = 0; p < 4; p++) {
+        if (page_tables[p].pte) {
+            free(page_tables[p].pte);
+        }
+    }
 
     return 0;
 }
